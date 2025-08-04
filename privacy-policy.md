@@ -1,7 +1,7 @@
 # Privacy Policy for FullFocus
 _Last updated: 4 August 2025_
 
-FullFocus (“the App”) is developed by **[Developer name / company]**.
+FullFocus (“the App”) is developed by Lachlan Philipson.
 
 ## Data we access
 - **Calendar events** – With your permission, the App reads your calendars to show upcoming meetings.
@@ -13,6 +13,3 @@ FullFocus (“the App”) is developed by **[Developer name / company]**.
 
 ## Your choices
 - You may revoke Calendar permission at any time in **System Settings ▸ Privacy & Security ▸ Calendars**; the App will stop reading events.
-
-## Contact
-Questions or concerns? Email **support@fullfocus.app**.
