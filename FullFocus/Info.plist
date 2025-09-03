@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2025 Lachlan Philipson. All rights reserved.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
-	<string>Needed to surface upcoming meetings so you never miss one during deep focus.</string>
+	<string>To keep you on time, FullFocus uses your calendars to display full-screen alerts and show upcoming events in the menu bar.</string>
 </dict>
 </plist>
