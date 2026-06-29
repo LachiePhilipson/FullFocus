@@ -1,38 +1,77 @@
 import Foundation
 import Combine
 import SwiftUI
+import OSLog
 @preconcurrency import EventKit
 
 @MainActor
 final class CalendarEventMonitor: ObservableObject {
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "FullFocus",
+        category: "CalendarEventMonitor"
+    )
+
     @Published var upcomingEvents: [CalendarEvent] = []
     @Published var showBadge: Bool = false
     @Published var isRefreshing: Bool = false
+    @Published var calendarAccessDenied: Bool = false
 
     private let minRefreshIndicatorDuration: TimeInterval = 0.7
     private var refreshStartTime: Date?
     private var refreshHideWorkItem: DispatchWorkItem?
     private let store = EKEventStore()
     private var timer: AnyCancellable?
+    private var hasStarted = false
     private var lastFetchMinute: Int?
     private var alertedEventIDs: Set<String> = []
     private let snoozeStore = SnoozeStore.shared
 
+    private var storeObserver: NSObjectProtocol?
+
     init() {
+        logger.info("CalendarEventMonitor initialized")
         requestAccess()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(storeChanged),
-            name: .EKEventStoreChanged,
-            object: store
-        )
+        storeObserver = NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged,
+            object: store,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.logger.info("EKEventStoreChanged received; refreshing calendars")
+                self.refresh()
+            }
+        }
     }
 
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        if let token = storeObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+    }
 
-    func start() { fetchEvents(); scheduleTimer() }
+    func start() {
+        guard !hasStarted else {
+            logger.info("Start requested after monitor was already started; fetching events")
+            fetchEvents()
+            return
+        }
+        hasStarted = true
+        logger.info("Starting calendar monitor")
+        fetchEvents()
+        scheduleTimer()
+    }
 
-    func refresh() { startRefreshing(); fetchEvents() }
+    func refresh() {
+        logger.info("Refresh requested; accessDenied=\(self.calendarAccessDenied, privacy: .public)")
+        startRefreshing()
+        if calendarAccessDenied {
+            logger.info("Refresh will request calendar access again")
+            requestAccess()
+        } else {
+            fetchEvents()
+        }
+    }
 
     private func startRefreshing() {
         refreshHideWorkItem?.cancel()
@@ -58,24 +97,42 @@ final class CalendarEventMonitor: ObservableObject {
     }
 
     private func requestAccess() {
+        logger.info("Requesting calendar access")
         if #available(macOS 14.0, *) {
             store.requestFullAccessToEvents { [weak self] granted, error in
                 DispatchQueue.main.async {
-                    if granted { self?.fetchEvents() }
-                    else { print("Calendar access denied: \(error?.localizedDescription ?? "Unknown error")") }
+                    if granted {
+                        self?.logger.info("Calendar full access granted")
+                        self?.calendarAccessDenied = false
+                        self?.start()
+                    } else {
+                        self?.logger.error("Calendar full access denied: \(error?.localizedDescription ?? "Unknown error", privacy: .public)")
+                        self?.calendarAccessDenied = true
+                        self?.upcomingEvents = []
+                        self?.endRefreshing()
+                    }
                 }
             }
         } else {
             store.requestAccess(to: .event) { [weak self] granted, error in
                 DispatchQueue.main.async {
-                    if granted { self?.fetchEvents() }
-                    else { print("Calendar access denied: \(error?.localizedDescription ?? "Unknown error")") }
+                    if granted {
+                        self?.logger.info("Calendar access granted")
+                        self?.calendarAccessDenied = false
+                        self?.start()
+                    } else {
+                        self?.logger.error("Calendar access denied: \(error?.localizedDescription ?? "Unknown error", privacy: .public)")
+                        self?.calendarAccessDenied = true
+                        self?.upcomingEvents = []
+                        self?.endRefreshing()
+                    }
                 }
             }
         }
     }
 
     private func scheduleTimer() {
+        logger.info("Scheduling calendar refresh timer")
         timer = Timer.publish(every: 30, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -92,20 +149,36 @@ final class CalendarEventMonitor: ObservableObject {
     }
 
     private func fetchEvents() {
+        guard !calendarAccessDenied else {
+            logger.warning("Fetch skipped because calendar access is denied")
+            upcomingEvents = []
+            endRefreshing()
+            return
+        }
+
         let settings = SettingsModel.shared
         let allCalendars = store.calendars(for: .event)
         let calendarsToUse: [EKCalendar]
-
-        if settings.enabledCalendarIDs.isEmpty {
+        let selectedCalendarCount = settings.hasSavedCalendarSelection ? settings.enabledCalendarIDs.count : allCalendars.count
+        if !settings.hasSavedCalendarSelection {
             calendarsToUse = allCalendars
+        } else if settings.enabledCalendarIDs.isEmpty {
+            calendarsToUse = []
         } else {
-            calendarsToUse = allCalendars.filter { settings.enabledCalendarIDs.contains($0.calendarIdentifier) }
+            let selectedCalendars = allCalendars.filter { settings.enabledCalendarIDs.contains($0.calendarIdentifier) }
+            calendarsToUse = selectedCalendars.isEmpty ? allCalendars : selectedCalendars
+            if selectedCalendars.isEmpty {
+                logger.warning("Saved calendar selection matched no current calendars; falling back to all calendars")
+            }
         }
 
         let now = Date()
         let windowEnd = Calendar.current.date(byAdding: .day, value: 7, to: now)!
 
+        logger.info("Fetching events; allCalendars=\(allCalendars.count, privacy: .public), selectedCalendarIDs=\(selectedCalendarCount, privacy: .public), calendarsQueried=\(calendarsToUse.count, privacy: .public), ignoreAllDay=\(settings.ignoreAllDayEvents, privacy: .public)")
+
         guard !calendarsToUse.isEmpty else {
+            logger.warning("Fetch stopped because EventKit returned zero calendars to query")
             upcomingEvents = []
             endRefreshing()
             return
@@ -113,44 +186,43 @@ final class CalendarEventMonitor: ObservableObject {
 
         let predicate = store.predicateForEvents(withStart: now, end: windowEnd, calendars: calendarsToUse)
         let ignoreAllDay = settings.ignoreAllDayEvents
-        let storeRef = self.store
-
-        struct UncheckedSendable<T>: @unchecked Sendable { let value: T }
-        let storeBox = UncheckedSendable(value: storeRef)
-        let predicateBox = UncheckedSendable(value: predicate)
-        let ignoreAllDayBox = ignoreAllDay
-        let nowBox = now
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let ekEvents = storeBox.value.events(matching: predicateBox.value)
-                .filter { event in
-                    if ignoreAllDayBox && event.isAllDay { return false }
-                    return event.endDate > nowBox
-                }
-                .sorted { $0.startDate < $1.startDate }
-
-            let mapped = ekEvents.map { event in
-                CalendarEvent(
-                    id: event.eventIdentifier,
-                    title: event.title,
-                    startDate: event.startDate,
-                    endDate: event.endDate,
-                    url: self.extractMeetingURL(from: event),
-                    isAllDay: event.isAllDay,
-                    calendar: event.calendar.title.cleanedCalendarName,
-                    calendarColor: Color(event.calendar.cgColor)
-                )
+        let matchedEvents = store.events(matching: predicate)
+        let ekEvents = matchedEvents
+            .filter { event in
+                if ignoreAllDay && event.isAllDay { return false }
+                return event.endDate > now
             }
+            .sorted { $0.startDate < $1.startDate }
 
-            Task { @MainActor in
-                self.upcomingEvents = mapped
-                let currentIDs = Set(mapped.map { $0.id })
-                self.alertedEventIDs = self.alertedEventIDs.intersection(currentIDs)
-                self.snoozeStore.purgeExpired()
-                self.updateBadgeState()
-                self.endRefreshing()
-            }
+        logger.info("Event fetch completed; matched=\(matchedEvents.count, privacy: .public), afterFilters=\(ekEvents.count, privacy: .public)")
+
+        let mapped = ekEvents.map { event in
+            CalendarEvent(
+                id: self.identifier(for: event),
+                title: event.title,
+                startDate: event.startDate,
+                endDate: event.endDate,
+                url: self.extractMeetingURL(from: event),
+                isAllDay: event.isAllDay,
+                calendar: event.calendar.title.cleanedCalendarName,
+                calendarColor: Color(event.calendar.cgColor)
+            )
         }
+
+        upcomingEvents = mapped
+        let uniqueIDCount = Set(mapped.map(\.id)).count
+        logger.info("Published upcoming events; count=\(mapped.count, privacy: .public), uniqueIDs=\(uniqueIDCount, privacy: .public)")
+        let currentIDs = Set(mapped.map { $0.id })
+        alertedEventIDs = alertedEventIDs.intersection(currentIDs)
+        snoozeStore.purgeExpired()
+        updateBadgeState()
+        endRefreshing()
+    }
+
+    private func identifier(for event: EKEvent) -> String {
+        let sourceID = event.eventIdentifier ?? event.calendarItemIdentifier
+        let occurrenceTime = Int(event.startDate.timeIntervalSinceReferenceDate)
+        return "\(sourceID)-\(occurrenceTime)"
     }
 
     nonisolated private func extractMeetingURL(from event: EKEvent) -> URL? {
@@ -208,6 +280,5 @@ final class CalendarEventMonitor: ObservableObject {
         showBadge = interval > 0 && interval <= leadTime
     }
 
-    @objc private func storeChanged() { fetchEvents() }
+    @objc private func storeChanged() { refresh() }
 }
-

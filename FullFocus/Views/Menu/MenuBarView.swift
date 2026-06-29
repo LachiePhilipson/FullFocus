@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import OSLog
 
 enum EventFilter: String, CaseIterable {
     case next = "Next"
@@ -8,8 +9,14 @@ enum EventFilter: String, CaseIterable {
 }
 
 struct MenuBarView: View {
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "FullFocus",
+        category: "MenuBar"
+    )
+
     @EnvironmentObject private var eventMonitor: CalendarEventMonitor
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.dismiss) private var dismiss
     @State private var eventFilter: EventFilter = .today
     @State private var hoveredEventID: String?
 
@@ -46,29 +53,72 @@ struct MenuBarView: View {
     }()
 
     private enum Layout {
-        static let rowEstimate: CGFloat = 66
-        static let headerEstimate: CGFloat = 36
-        static let verticalInsets: CGFloat = 12
+        static let rowEstimate: CGFloat = 58
+        static let wrappedRowEstimate: CGFloat = 78
+        static let headerEstimate: CGFloat = 38
+        static let dividerEstimate: CGFloat = 17
+        static let verticalInsets: CGFloat = 8
+        static let maxScrollableHeight: CGFloat = 620
     }
 
-    private var baseScrollHeight: CGFloat {
+    private var calculatedEventsHeight: CGFloat {
         switch eventFilter {
         case .next:
-            return Layout.rowEstimate * 2 + Layout.verticalInsets
+            return eventListHeight(for: filteredEvents.prefix(1)) + Layout.verticalInsets
         case .today:
-            let rows = min(5, filteredEvents.count)
-            let base = CGFloat(max(rows, 1)) * Layout.rowEstimate
-            return base + Layout.verticalInsets
+            return eventListHeight(for: filteredEvents) + Layout.verticalInsets
         case .week:
-            let maxDays = 3
-            let maxRowsPerDay = 3
-            let totalHeaders = Layout.headerEstimate * CGFloat(maxDays)
-            let totalRows = Layout.rowEstimate * CGFloat(maxDays * maxRowsPerDay)
-            return totalHeaders + totalRows + Layout.verticalInsets
+            guard !groupedWeekEvents.isEmpty else {
+                return Layout.rowEstimate + Layout.verticalInsets
+            }
+
+            return groupedWeekEvents.reduce(CGFloat(0)) { total, group in
+                total
+                    + Layout.headerEstimate
+                    + eventListHeight(for: group.events)
+                    + (group.date == groupedWeekEvents.last?.date ? 0 : Layout.dividerEstimate)
+            } + Layout.verticalInsets
         }
     }
 
-    private var maxScrollHeight: CGFloat { baseScrollHeight * 2 }
+    private func eventListHeight<S: Sequence>(for events: S) -> CGFloat where S.Element == CalendarEvent {
+        let eventArray = Array(events)
+        guard !eventArray.isEmpty else {
+            return Layout.rowEstimate
+        }
+
+        return eventArray.enumerated().reduce(CGFloat(0)) { total, pair in
+            let (_, event) = pair
+            return total + estimatedRowHeight(for: event)
+        } + CGFloat(max(eventArray.count - 1, 0)) * Layout.dividerEstimate
+    }
+
+    private func estimatedRowHeight(for event: CalendarEvent) -> CGFloat {
+        if event.title.count > 36 {
+            return Layout.wrappedRowEstimate
+        } else {
+            return Layout.rowEstimate
+        }
+    }
+
+    private var eventsSectionHeight: CGFloat? {
+        switch eventFilter {
+        case .next:
+            return nil
+        case .today:
+            return min(calculatedEventsHeight, Layout.maxScrollableHeight)
+        case .week:
+            return min(calculatedEventsHeight, Layout.maxScrollableHeight)
+        }
+    }
+
+    private var usesScrollView: Bool {
+        guard let height = eventsSectionHeight else {
+            return false
+        }
+
+        return calculatedEventsHeight > height
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -79,7 +129,9 @@ struct MenuBarView: View {
             footerSection
         }
         .frame(width: 320)
-        .task { eventMonitor.start() }
+        .onAppear { logVisibleEventState(reason: "menu appeared") }
+        .onChange(of: eventFilter) { _, _ in logVisibleEventState(reason: "filter changed") }
+        .onChange(of: eventMonitor.upcomingEvents.count) { _, _ in logVisibleEventState(reason: "upcoming count changed") }
     }
 
     // Sections
@@ -102,9 +154,34 @@ struct MenuBarView: View {
         .padding(8)
     }
 
-    private var eventsScrollSection: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 6) {
+    @ViewBuilder private var eventsScrollSection: some View {
+        if let height = eventsSectionHeight {
+            sizedEventsSection
+                .frame(height: height, alignment: .top)
+        } else {
+            eventListContent
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder private var sizedEventsSection: some View {
+        if usesScrollView {
+            ScrollView { eventListContent }
+        } else {
+            eventListContent
+        }
+    }
+
+    @ViewBuilder private var eventListContent: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if eventMonitor.calendarAccessDenied {
+                statusMessage(
+                    "Calendar access is required",
+                    systemImage: "calendar.badge.exclamationmark"
+                )
+            } else if filteredEvents.isEmpty {
+                statusMessage(emptyEventsMessage, systemImage: "calendar")
+            } else {
                 switch eventFilter {
                 case .week:
                     weekList
@@ -113,7 +190,18 @@ struct MenuBarView: View {
                 }
             }
         }
-        .frame(maxHeight: maxScrollHeight)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var emptyEventsMessage: String {
+        switch eventFilter {
+        case .next:
+            return "No upcoming events"
+        case .today:
+            return "No events today"
+        case .week:
+            return "No events this week"
+        }
     }
 
     @ViewBuilder private var weekList: some View {
@@ -152,52 +240,62 @@ struct MenuBarView: View {
 
     @ViewBuilder private var dayList: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if filteredEvents.isEmpty {
-                Text("No upcoming events")
-                    .font(.body)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: Layout.rowEstimate)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.clear)
-                    )
-            } else {
-                ForEach(filteredEvents) { event in
-                    MenuEventRow(
-                        event: event,
-                        isHovered: hoveredEventID == event.id,
-                        onTap: {
-                            FullScreenAlert.shared.show(
-                                event: event,
-                                onSnooze: { minutes in eventMonitor.snooze(event, minutes: minutes) },
-                                onCustomSnooze: { date in
-                                    let mins = max(1, Int(date.timeIntervalSinceNow / 60))
-                                    eventMonitor.snooze(event, minutes: mins)
-                                }
-                            )
-                        }
-                    )
-                    .onHover { hovering in hoveredEventID = hovering ? event.id : nil }
-
-                    if event.id != filteredEvents.last?.id {
-                        Divider().padding(.horizontal, 12)
+            ForEach(filteredEvents) { event in
+                MenuEventRow(
+                    event: event,
+                    isHovered: hoveredEventID == event.id,
+                    onTap: {
+                        FullScreenAlert.shared.show(
+                            event: event,
+                            onSnooze: { minutes in eventMonitor.snooze(event, minutes: minutes) },
+                            onCustomSnooze: { date in
+                                let mins = max(1, Int(date.timeIntervalSinceNow / 60))
+                                eventMonitor.snooze(event, minutes: mins)
+                            }
+                        )
                     }
+                )
+                .onHover { hovering in hoveredEventID = hovering ? event.id : nil }
+
+                if event.id != filteredEvents.last?.id {
+                    Divider().padding(.horizontal, 12)
                 }
             }
         }
         .padding(4)
     }
 
+    private func statusMessage(_ message: String, systemImage: String) -> some View {
+        Label(message, systemImage: systemImage)
+            .font(.body)
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity)
+            .frame(height: Layout.rowEstimate)
+            .padding(4)
+            .accessibilityElement(children: .combine)
+    }
+
+    private func logVisibleEventState(reason: String) {
+        logger.info("Menu render state: \(reason, privacy: .public); filter=\(eventFilter.rawValue, privacy: .public), upcoming=\(eventMonitor.upcomingEvents.count, privacy: .public), filtered=\(filteredEvents.count, privacy: .public), accessDenied=\(eventMonitor.calendarAccessDenied, privacy: .public)")
+    }
+
     private var footerSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button("Settings…") {
-                NSApp.activate(ignoringOtherApps: true)
-                openSettings()
+                // Close the menu bar dropdown/window first
+                dismiss()
+                // Then bring the app to the foreground and open Settings
+                DispatchQueue.main.async {
+                    NSApp.activate(ignoringOtherApps: true)
+                    openSettings()
+                }
             }
             .buttonStyle(ControlCenterButtonStyle())
 
-            Button(action: { eventMonitor.refresh() }) {
+            Button(action: {
+                logger.info("Refresh Calendars selected from menu bar")
+                eventMonitor.refresh()
+            }) {
                 HStack {
                     Text("Refresh Calendars")
                     Spacer()

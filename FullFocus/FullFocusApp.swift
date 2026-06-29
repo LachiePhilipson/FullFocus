@@ -6,6 +6,7 @@ struct FullFocusApp: App {
 
     init() {
         Defaults.register()
+        AboutWindowElevator.shared.start()
     }
 
     var body: some Scene {

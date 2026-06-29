@@ -80,6 +80,7 @@ struct MenuEventRow: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .contentShape(Rectangle())
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 @preconcurrency import EventKit
 
 struct CalendarsSettingsPane: View {
@@ -6,12 +7,23 @@ struct CalendarsSettingsPane: View {
     @EnvironmentObject var eventMonitor: CalendarEventMonitor
     @State private var availableCalendars: [EKCalendar] = []
     @State private var storeChangeObserver: NSObjectProtocol?
+    @State private var accessDenied: Bool = false
     private let store = EKEventStore()
 
     var body: some View {
         Form {
             Section("Calendars") {
-                if availableCalendars.isEmpty {
+                if accessDenied {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Calendar access is required", systemImage: "calendar.badge.exclamationmark")
+                            .foregroundStyle(.secondary)
+                        Button("Open System Settings…") { openCalendarPrivacySettings() }
+                            .buttonStyle(.link)
+                        Text("Grant permission to access your calendars, then return to the app.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if availableCalendars.isEmpty {
                     HStack {
                         ProgressView().scaleEffect(0.8)
                         Text("Loading Calendars…").foregroundColor(.secondary)
@@ -19,7 +31,7 @@ struct CalendarsSettingsPane: View {
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            let selectedCount = settings.enabledCalendarIDs.count
+                            let selectedCount = selectedCalendarCount
                             let totalCount = availableCalendars.count
 
                             Text("\(selectedCount) of \(totalCount) selected")
@@ -29,12 +41,7 @@ struct CalendarsSettingsPane: View {
                             Spacer()
 
                             Button(selectedCount == totalCount ? "Deselect All" : "Select All") {
-                                if selectedCount == totalCount {
-                                    settings.enabledCalendarIDs = []
-                                } else {
-                                    settings.enabledCalendarIDs = Set(availableCalendars.map { $0.calendarIdentifier })
-                                }
-                                eventMonitor.refresh()
+                                setAllCalendarsSelected(selectedCount != totalCount)
                             }
                             .buttonStyle(.link)
                         }
@@ -45,15 +52,10 @@ struct CalendarsSettingsPane: View {
                                     calendar: calendar,
                                     isEnabled: Binding(
                                         get: {
-                                            settings.enabledCalendarIDs.contains(calendar.calendarIdentifier)
+                                            isCalendarEnabled(calendar)
                                         },
                                         set: { isOn in
-                                            if isOn {
-                                                settings.enabledCalendarIDs.insert(calendar.calendarIdentifier)
-                                            } else {
-                                                settings.enabledCalendarIDs.remove(calendar.calendarIdentifier)
-                                            }
-                                            eventMonitor.refresh()
+                                            setCalendar(calendar, isEnabled: isOn)
                                         }
                                     )
                                 )
@@ -86,19 +88,73 @@ struct CalendarsSettingsPane: View {
         }
     }
 
+    private var selectedCalendarCount: Int {
+        guard settings.hasSavedCalendarSelection else {
+            return availableCalendars.count
+        }
+
+        let availableIDs = Set(availableCalendars.map { $0.calendarIdentifier })
+        return settings.enabledCalendarIDs.intersection(availableIDs).count
+    }
+
+    private func isCalendarEnabled(_ calendar: EKCalendar) -> Bool {
+        !settings.hasSavedCalendarSelection || settings.enabledCalendarIDs.contains(calendar.calendarIdentifier)
+    }
+
+    private func setAllCalendarsSelected(_ isSelected: Bool) {
+        settings.enabledCalendarIDs = isSelected ? Set(availableCalendars.map { $0.calendarIdentifier }) : []
+        eventMonitor.refresh()
+    }
+
+    private func setCalendar(_ calendar: EKCalendar, isEnabled: Bool) {
+        var enabledIDs = settings.hasSavedCalendarSelection
+            ? settings.enabledCalendarIDs
+            : Set(availableCalendars.map { $0.calendarIdentifier })
+
+        if isEnabled {
+            enabledIDs.insert(calendar.calendarIdentifier)
+        } else {
+            enabledIDs.remove(calendar.calendarIdentifier)
+        }
+
+        settings.enabledCalendarIDs = enabledIDs
+        eventMonitor.refresh()
+    }
+
     private func requestAccessIfNeeded() {
         if #available(macOS 14.0, *) {
-            store.requestFullAccessToEvents { [weak store] granted, _ in
-                DispatchQueue.main.async {
-                    if granted { availableCalendars = store?.calendars(for: .event) ?? [] }
+            store.requestFullAccessToEvents { granted, _ in
+                Task { @MainActor in
+                    self.accessDenied = !granted
+                    if granted {
+                        availableCalendars = self.store.calendars(for: .event)
+                    } else {
+                        availableCalendars = []
+                    }
                 }
             }
         } else {
-            store.requestAccess(to: .event) { [weak store] granted, _ in
-                DispatchQueue.main.async {
-                    if granted { availableCalendars = store?.calendars(for: .event) ?? [] }
+            store.requestAccess(to: .event) { granted, _ in
+                Task { @MainActor in
+                    self.accessDenied = !granted
+                    if granted {
+                        availableCalendars = self.store.calendars(for: .event)
+                    } else {
+                        availableCalendars = []
+                    }
                 }
             }
+        }
+    }
+    
+    private func openCalendarPrivacySettings() {
+        let ws = NSWorkspace.shared
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Settings.extension/Privacy_Calendars") {
+            ws.open(url)
+            return
+        }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference/security?Privacy") {
+            ws.open(url)
         }
     }
 }

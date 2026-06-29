@@ -16,7 +16,7 @@ struct GeneralSettingsPane: View {
 
     var body: some View {
         Form {
-            Section("Startup") {
+            Section {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, newValue in
                         Task { @MainActor in
@@ -32,9 +32,11 @@ struct GeneralSettingsPane: View {
                             }
                         }
                     }
+            } header: {
+                Text("Startup")
             }
 
-            Section("Links") {
+            Section {
                 if browsers.isEmpty {
                     HStack {
                         ProgressView().scaleEffect(0.8)
@@ -55,9 +57,12 @@ struct GeneralSettingsPane: View {
                     }
                     .pickerStyle(.menu)
                 }
+            } header: {
+                Text("Links")
             }
 
-            Section("Learn More") {
+            Section {
+                Text("FullFocus is made by Lachlan Philipson.")
                 Button("About FullFocus") {
                     NSApp.activate(ignoringOtherApps: true)
                     NSApp.orderFrontStandardAboutPanel(nil)
@@ -69,12 +74,18 @@ struct GeneralSettingsPane: View {
                         }
                     }
                 }
+                .buttonStyle(.link)
+            } header: {
+                Text("Learn More")
             }
         }
         .formStyle(.grouped)
         .padding()
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear(perform: loadBrowsers)
+        .onAppear {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loadBrowsers()
+        }
     }
 
     private func loadBrowsers() {

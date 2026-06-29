@@ -24,6 +24,10 @@ final class SettingsModel: ObservableObject {
     /// Empty string means not set yet; UI will initialize to system default.
     @AppStorage("preferredBrowserBundleID") var preferredBrowserBundleID: String = ""
 
+    var hasSavedCalendarSelection: Bool {
+        !enabledCalendarIDsData.isEmpty
+    }
+
     @Published var enabledCalendarIDs: Set<String> = [] {
         didSet {
             if let data = try? JSONEncoder().encode(enabledCalendarIDs) {
@@ -38,4 +42,3 @@ final class SettingsModel: ObservableObject {
         }
     }
 }
-
